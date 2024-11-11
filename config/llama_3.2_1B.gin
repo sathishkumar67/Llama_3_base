@@ -1,0 +1,11 @@
+ModelArgs.dim = 2048
+ModelArgs.n_layers = 16
+ModelArgs.n_heads = 32
+ModelArgs.n_kv_heads = 8
+ModelArgs.vocab_size = 128256
+ModelArgs.multiple_of = 256
+ModelArgs.ffn_dim_multiplier = 1.5
+ModelArgs.norm_eps = 1e-5
+ModelArgs.rope_theta = 500000.0
+ModelArgs.max_batch_size = 0
+ModelArgs.max_seq_len = 8192

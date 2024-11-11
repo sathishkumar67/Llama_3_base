@@ -1,1 +1,3 @@
 # need to check column and row parallel linear layers in fairscale
+# trying out flash attention
+# adding comments and docstring

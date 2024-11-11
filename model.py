@@ -21,6 +21,7 @@ class ModelArgs:
     rope_theta: float
     max_batch_size: int
     max_seq_len: int
+    attn_dropout: float = 0.0
 
 
 class RMSNorm(torch.nn.Module):
@@ -72,20 +73,17 @@ class Attention(nn.Module):
 
         Args:
             args: An instance of ModelArgs containing configuration parameters such as
-                dimensions, number of heads, vocabulary size, and other hyperparameters.
+                dimensions, number of heads, and maximum sequence length.
 
         Attributes:
-            n_kv_heads: The number of key-value heads.
-            n_rep: The number of times to repeat the key-value heads.
+            n_heads: The number of attention heads.
+            n_kv_heads: The number of key-value heads (default: same as n_heads).
+            n_rep: The number of times to repeat key-value heads if n_kv_heads < n_heads.
             head_dim: The dimension of each attention head.
-            wq: The linear layer for queries.
-            wk: The linear layer for keys.
-            wv: The linear layer for values.
-            wo: The linear layer for output.
-            cache_k: The cache to store the key tensors.
-            cache_v: The cache to store the value tensors.
+            wq, wk, wv, wo: Linear layers for queries, keys, values, and output.
         """
         super().__init__()
+        self.args = args
         self.n_heads = args.n_heads
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_rep = args.n_heads // self.n_kv_heads
@@ -97,92 +95,44 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        # kv cache to store the key and value tensors 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            )
-        )
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            )
-        )
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):        
+        """
+        Computes the output of the attention module.
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ):        
-        """Computes the output of the attention module.
-
-        Given an input tensor `x`, starting position `start_pos`, precomputed frequencies
-        `freqs_cis` and an optional tensor `mask`, apply the attention module to produce the
-        output.
-
-        The attention module first computes the key and value tensors by applying the linear
-        layers `wk` and `wv` to the input tensor `x`. The key and value tensors are then stored
-        in the cache `cache_k` and `cache_v` respectively.
-
-        The attention scores are then computed by taking the dot product of the query tensor
-        `xq` and the key tensor `keys`. The attention scores are then normalized by applying a
-        softmax function. The output is then computed by taking the dot product of the
-        attention scores and the value tensor `values`.
-
-        The output is then passed through the linear layer `wo` to produce the final output.
+        Given an input tensor `x`, precomputed frequencies `freqs_cis`, and
+        configuration parameters `args`, apply the attention mechanism to produce
+        the output.
 
         Args:
             x: The input tensor.
-            start_pos: The starting position of the current segment in the cache.
             freqs_cis: The precomputed frequencies for the rotary embedding.
-            mask: An optional tensor with shape (batch_size, n_heads, seq_len, cache_len + seq_len)
-                to mask out the scores of invalid positions."""
+
+        Returns:
+            The output of the attention module.
+        """
         bsz, seqlen, _ = x.shape
+
+        # linear projections for queries, keys, and values
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        # reshape for attention computation
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
+        # apply rotary embeddings
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
-
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
-
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_heads, head_dim)
-        values = repeat_kv(
-            values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_heads, head_dim)
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
 
-        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+        # compute attention
+        y = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, dropout_p=self.args.attn_dropout)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.n_heads * self.head_dim)
+
+        # output projection
+        return self.wo(y)
 
 
 class FeedForward(nn.Module):

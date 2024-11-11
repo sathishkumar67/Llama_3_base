@@ -1,0 +1,42 @@
+# .pt and .pth are most common extensions for PyTorch model save files
+torch.save(model.state_dict(), 'model.pt')
+torch.save(model.state_dict(), 'model.pth')
+torch.save(model, 'model.pth')
+
+# .bin less commonly used but sometimes used when saving models to be loaded by other frameworks or APIs
+torch.save(model.state_dict(), "model.bin)
+
+# when saving the whole model it save both
+    1. Model Architecture - entire structure and configuration of the model. can loaded without the architecture defined in code
+    2. Model parameters - learned weights and biases for each layer for the model
+
+    When you load this saved file, you can directly use it for inference or further training without needing to reinitialize the model structure, as it includes both the architecture and the weights.
+
+    In contrast, when saving only the state dictionary (e.g., model.state_dict()), you only save the parameters (weights and biases) and need to have the model architecture defined in code to load these parameters. This approach is often more flexible and lightweight, especially when sharing models or deploying them across different environments.
+
+# Loading a Model's State Dictionary
+If you saved only the model’s state dictionary (the parameters/weights) with torch.save(model.state_dict(), "model.pth"), you need to:
+    * Re-define the model architecture in code.
+    * Load the saved state dictionary into this model.
+
+    import torch
+
+    # Define your model architecture
+    model = MyModel()  # Replace MyModel with your model class
+
+    # Load the state dictionary
+    model.load_state_dict(torch.load("model.pth"))
+
+    # Set the model to evaluation mode if you’re using it for inference
+    model.eval()
+
+# Loading the Entire Model (Architecture + Parameters)
+If you saved the entire model (architecture + weights) with torch.save(model, "model.pth"), you can load it directly without redefining the model architecture:
+
+    import torch
+
+    # Load the entire model
+    model = torch.load("model.pth")
+
+    # Set the model to evaluation mode if you’re using it for inference
+    model.eval()

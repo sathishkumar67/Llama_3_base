@@ -4,8 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import gin
-from typing import Tuple, Optional
-
+from typing import Optional
+from functions import precompute_freqs_cis, apply_rotary_emb, repeat_kv, reshape_for_broadcast
 
 @gin.configurable
 @dataclass
@@ -21,105 +21,6 @@ class ModelArgs:
     rope_theta: float
     max_batch_size: int
     max_seq_len: int
-
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0) -> torch.Tensor:
-    """
-    Precompute the frequencies for the rotary position embedding.
-
-    Args:
-        dim: The last dimension of the input tensor.
-        end: The first dimension of the input tensor.
-        theta: The temperature in the computation of the frequencies.
-
-    Returns:
-        A tensor of shape `(end, dim)` with the precomputed frequencies.
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Reshape the precomputed frequencies for rotary embeddings to be broadcasted to x.
-
-    The shape of freqs_cis is (seq_len, dim) and the shape of x is (batch_size, seq_len, dim).
-    We want to reshape freqs_cis to be (1, seq_len, 1, dim) so that it can be broadcasted to
-    x.
-
-    Args:
-        freqs_cis: The precomputed frequencies for the rotary embeddings.
-        x: The tensor to which the rotary embeddings will be applied.
-
-    Returns:
-        The reshaped frequencies.
-    """
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply the rotary embeddings to the query and key tensors.
-
-    The rotary embeddings are precomputed using the `precompute_freqs_cis` function.
-    The query and key tensors are reshaped to have shape (batch_size, seq_len, dim),
-    and the precomputed frequencies are reshaped to have shape (1, seq_len, 1, dim)
-    so that they can be broadcasted to the query and key tensors.
-
-    The rotary embeddings are applied by element-wise multiplying the query and key
-    tensors with the precomputed frequencies.
-
-    Args:
-        xq: The query tensor.
-        xk: The key tensor.
-        freqs_cis: The precomputed frequencies.
-
-    Returns:
-        The query and key tensors after applying the rotary embeddings.
-    """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Repeat the key-value heads of a tensor.
-
-    This function takes an input tensor `x` of shape (batch_size, seq_len, n_kv_heads, head_dim)
-    and repeats the key-value heads `n_rep` times, resulting in a new tensor with
-    shape (batch_size, seq_len, n_kv_heads * n_rep, head_dim).
-
-    Args:
-        x: The input tensor with shape (batch_size, seq_len, n_kv_heads, head_dim).
-        n_rep: The number of times to repeat the key-value heads.
-
-    Returns:
-        A tensor with shape (batch_size, seq_len, n_kv_heads * n_rep, head_dim) after repeating
-        the key-value heads.
-    """
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
 
 
 class RMSNorm(torch.nn.Module):
@@ -148,7 +49,6 @@ class RMSNorm(torch.nn.Module):
         Returns:
             The RMSNorm of the input tensor.
         """
-        
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):        
@@ -172,22 +72,23 @@ class Attention(nn.Module):
 
         Args:
             args: An instance of ModelArgs containing configuration parameters such as
-                dimensions, number of heads, and maximum sequence length.
+                dimensions, number of heads, vocabulary size, and other hyperparameters.
 
         Attributes:
-            n_kv_heads: The number of key-value heads, derived from args.
-            n_rep: The number of repetitions for key-value heads if needed.
-            head_dim: The dimension of each head, calculated from args.
-            wq: A linear layer for transforming input to query vectors.
-            wk: A linear layer for transforming input to key vectors.
-            wv: A linear layer for transforming input to value vectors.
-            wo: A linear layer for outputting the final result after attention.
-            cache_k: A tensor to cache key vectors for attention.
-            cache_v: A tensor to cache value vectors for attention.
+            n_kv_heads: The number of key-value heads.
+            n_rep: The number of times to repeat the key-value heads.
+            head_dim: The dimension of each attention head.
+            wq: The linear layer for queries.
+            wk: The linear layer for keys.
+            wv: The linear layer for values.
+            wo: The linear layer for output.
+            cache_k: The cache to store the key tensors.
+            cache_v: The cache to store the value tensors.
         """
         super().__init__()
+        self.n_heads = args.n_heads
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_rep = args.n_heads // self.n_kv_heads
         self.head_dim = args.dim // args.n_heads
 
         # linear layers for queries, keys, and values
@@ -201,7 +102,7 @@ class Attention(nn.Module):
             (
                 args.max_batch_size,
                 args.max_seq_len,
-                self.n_local_kv_heads,
+                self.n_kv_heads,
                 self.head_dim,
             )
         )
@@ -209,7 +110,7 @@ class Attention(nn.Module):
             (
                 args.max_batch_size,
                 args.max_seq_len,
-                self.n_local_kv_heads,
+                self.n_kv_heads,
                 self.head_dim,
             )
         )
@@ -221,23 +122,35 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):        
-        """Computes the forward pass of the attention module.
+        """Computes the output of the attention module.
+
+        Given an input tensor `x`, starting position `start_pos`, precomputed frequencies
+        `freqs_cis` and an optional tensor `mask`, apply the attention module to produce the
+        output.
+
+        The attention module first computes the key and value tensors by applying the linear
+        layers `wk` and `wv` to the input tensor `x`. The key and value tensors are then stored
+        in the cache `cache_k` and `cache_v` respectively.
+
+        The attention scores are then computed by taking the dot product of the query tensor
+        `xq` and the key tensor `keys`. The attention scores are then normalized by applying a
+        softmax function. The output is then computed by taking the dot product of the
+        attention scores and the value tensor `values`.
+
+        The output is then passed through the linear layer `wo` to produce the final output.
 
         Args:
-            x: The input tensor with shape (batch_size, seq_len, dim).
+            x: The input tensor.
             start_pos: The starting position of the current segment in the cache.
             freqs_cis: The precomputed frequencies for the rotary embedding.
-            mask: An optional tensor with shape (batch_size, n_local_heads, seq_len, cache_len + seq_len)
-                to mask out the scores of invalid positions.
-
-        Returns:
-            The output tensor with shape (batch_size, seq_len, dim) after applying the attention mechanism."""
+            mask: An optional tensor with shape (batch_size, n_heads, seq_len, cache_len + seq_len)
+                to mask out the scores of invalid positions."""
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -253,21 +166,21 @@ class Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
             keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
         values = repeat_kv(
             values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        )  # (bs, cache_len + seqlen, n_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_heads, cache_len + seqlen, head_dim)
         values = values.transpose(
             1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        )  # (bs, n_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask  # (bs, n_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -371,7 +284,7 @@ class TransformerBlock(nn.Module):
             x: The input tensor.
             start_pos: The starting position of the current segment in the cache.
             freqs_cis: The precomputed frequencies for the rotary embedding.
-            mask: An optional tensor with shape (batch_size, n_local_heads, seq_len, cache_len + seq_len)
+            mask: An optional tensor with shape (batch_size, n_heads, seq_len, cache_len + seq_len)
                 to mask out the scores of invalid positions.
 
         Returns:
@@ -423,6 +336,9 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
+        # tie the weights of the token embeddings and the output layer
+        self.tok_embeddings.weight = self.output.weight
+
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         """
@@ -446,7 +362,6 @@ class Transformer(nn.Module):
         Returns:
             A tensor of shape (batch_size, seq_len, vocab_size) containing the
             output logits.
-
         """
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)

@@ -10,17 +10,17 @@ from functions import precompute_freqs_cis, apply_rotary_emb, repeat_kv, reshape
 @gin.configurable
 @dataclass
 class ModelArgs:
-    dim: int = 128
-    n_layers: int = 4
-    n_heads: int = 4
-    n_kv_heads: int = 2
-    vocab_size: int = 256
-    multiple_of: int = 64
-    ffn_dim_multiplier: float = 1.5
-    norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
-    max_batch_size: int = 128
-    max_seq_len: int = 1024
+    dim: int
+    n_layers: int 
+    n_heads: int 
+    n_kv_heads: int 
+    vocab_size: int 
+    multiple_of: int 
+    ffn_dim_multiplier: float
+    norm_eps: float 
+    rope_theta: float 
+    max_batch_size: int
+    max_seq_len: int
     attn_dropout: float = 0.0
 
 
@@ -261,7 +261,7 @@ class Transformer(nn.Module):
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock(params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)

@@ -10,17 +10,17 @@ from functions import precompute_freqs_cis, apply_rotary_emb, repeat_kv, reshape
 @gin.configurable
 @dataclass
 class ModelArgs:
-    dim: int
-    n_layers: int
-    n_heads: int
-    n_kv_heads: int
-    vocab_size: int
-    multiple_of: int
-    ffn_dim_multiplier: float
-    norm_eps: float
-    rope_theta: float
-    max_batch_size: int
-    max_seq_len: int
+    dim: int = 128
+    n_layers: int = 4
+    n_heads: int = 4
+    n_kv_heads: int = 2
+    vocab_size: int = 256
+    multiple_of: int = 64
+    ffn_dim_multiplier: float = 1.5
+    norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+    max_batch_size: int = 128
+    max_seq_len: int = 1024
     attn_dropout: float = 0.0
 
 
@@ -116,7 +116,7 @@ class Attention(nn.Module):
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         # reshape for attention computation
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
@@ -124,6 +124,7 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         # repeat k/v heads if n_kv_heads < n_heads
+        xq = xq.transpose(1, 2)
         xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
         xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
 
@@ -182,12 +183,11 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, args: ModelArgs):
         """
         Initializes the TransformerBlock module.
 
         Args:
-            layer_id: The layer ID in the layer stack.
             args: An instance of ModelArgs containing configuration parameters such as
                 dimensions, number of heads, and maximum sequence length.
 
@@ -197,7 +197,6 @@ class TransformerBlock(nn.Module):
             head_dim: The dimension of each attention head.
             attention: The attention module.
             feed_forward: The feed-forward network module.
-            layer_id: The layer ID in the layer stack.
             attention_norm: The normalization module for the attention module.
             ffn_norm: The normalization module for the feed-forward network module.
         """
@@ -212,42 +211,29 @@ class TransformerBlock(nn.Module):
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
         )
-        self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ):
-        """
-        Computes the output of the transformer block.
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+        """Computes the output of the transformer block.
 
-        Given an input tensor `x`, starting position `start_pos`, precomputed frequencies
-        `freqs_cis` and an optional tensor `mask`, apply the attention module and the
-        feed-forward network module to produce the output.
+        Given an input tensor `x`, precomputed frequencies `freqs_cis`, applies the
+        attention module and the feed-forward network module to produce the output.
 
         Args:
             x: The input tensor.
-            start_pos: The starting position of the current segment in the cache.
             freqs_cis: The precomputed frequencies for the rotary embedding.
-            mask: An optional tensor with shape (batch_size, n_heads, seq_len, cache_len + seq_len)
-                to mask out the scores of invalid positions.
 
         Returns:
-            The output tensor after applying the transformer block.
-        """
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+            The output tensor after applying the transformer block."""
+        h = x + self.attention(self.attention_norm(x), freqs_cis)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+    def __init__(self, params: ModelArgs) -> None:
         """
         Initializes the Transformer model.
 
@@ -282,58 +268,23 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
-            params.max_seq_len * 2,
+            params.max_seq_len, # here max_seq_len * 2 was used before if any error occurs change back to max_seq_len * 2
             params.rope_theta,
         )
 
         # tie the weights of the token embeddings and the output layer
         self.tok_embeddings.weight = self.output.weight
 
-    @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
-        """
-        Given a tensor of tokens, applies the transformer model to generate a
-        tensor of output logits.
-
-        The transformer model consists of a sequence of TransformerBlock layers.
-        Each TransformerBlock layer applies a multi-head self-attention mechanism
-        using the rotary embeddings, followed by a feed-forward network.
-
-        The method takes two arguments: `tokens` and `start_pos`. `tokens` is a
-        tensor of shape (batch_size, seq_len) containing the input tokens. `start_pos`
-        is an integer indicating the starting position of the current segment in
-        the cache.
-
-        The method first embeds the input tokens using the `tok_embeddings` layer.
-        It then applies the TransformerBlock layers sequentially to the embedded
-        tokens. The output of the last layer is normalized using the `norm` layer,
-        and the output logits are generated using the `output` layer.
-
-        Returns:
-            A tensor of shape (batch_size, seq_len, vocab_size) containing the
-            output logits.
-        """
+    def forward(self, tokens: torch.Tensor, target: torch.Tensor) :
         _bsz, seqlen = tokens.shape
+        
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
-            mask = torch.triu(mask, diagonal=1)
-
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
-
+        
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, self.freqs_cis)
+        
         h = self.norm(h)
-        output = self.output(h).float()
+        output = self.output(h)
+        
         return output
